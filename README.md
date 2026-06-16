@@ -50,8 +50,15 @@ camera_video.mp4.json
 5. Select the active event and press `End Event`.
 6. Press `Open Video` to continue with the next file, or `Quit` to exit.
 
-The JSON is saved immediately when an event is ended, and also after edits or
-deletes of existing events.
+The proper `<video>.json` is written only when you **Save** (`Ctrl+S` or the
+`Save` button), or when you choose **Save** on the prompt shown if you quit with
+unsaved changes.
+
+While you edit, in-progress work is continuously auto-saved to a hidden recovery
+cache next to the video (`.<video>.recovery.json`), so an accidental quit or
+crash won't lose it. Reopening a video that has cached unsaved work prompts you
+to recover it; saving (or quitting cleanly without unsaved changes) clears the
+cache.
 
 ## Controls
 
@@ -86,3 +93,40 @@ The JSON format is:
   ]
 }
 ```
+
+## FP Review tool (`fp_review.py`)
+
+A separate triage tool for reviewing detector output as true/false positives.
+It pairs each `<clip>.mp4` with its sibling `<clip>.mp4.overlay.json` (detector
+boxes), plays the clip in a loop at high speed with the boxes drawn on top, and
+captures a verdict per clip.
+
+```bash
+python3 fp_review.py /path/to/clips_folder      # or omit the path for a folder picker
+python3 fp_review.py /path/to/clips_folder --speed 16
+```
+
+Keys:
+
+```text
+1        Mark TRUE positive (writes <clip>.json) and advance
+Space    Mark FALSE positive and advance
+n / b    Next / back without a verdict
+r        Replay current clip from start
+t        Toggle playback speed (x8 / x16)
+q / Esc  Quit
+```
+
+Behavior:
+
+- **Overlay sync** — overlay frames are time-indexed, so boxes are matched to
+  each video frame by timestamp (not by frame index). Box color follows the
+  `tone` field (`danger` = red, `warning` = amber).
+- **TP** — a `<clip>.json` annotation is written in the same schema as above. A
+  single `zone` event is derived from the `restricted zone crossing` detection:
+  its active frame range and the union of its boxes (normalized). These files
+  open directly in the annotator.
+- **FP** — logged only; no annotation file is written.
+- **Resume / audit** — every verdict is recorded in `fp_review_results.json` in
+  the folder. On launch, already-reviewed clips are skipped (review starts at the
+  first unreviewed clip).

@@ -20,6 +20,8 @@ DEFAULT_MAX_DISPLAY_WIDTH = 1280
 DEFAULT_MAX_DISPLAY_HEIGHT = 720
 MIN_BOX_SIZE = 3
 PLAYBACK_SPEEDS = (1, 2, 4, 8)
+EVENT_TYPES = ("fighting", "fire", "smoke", "zone", "throwing")
+AUTOSAVE_DELAY_MS = 1000
 
 Color = tuple[int, int, int]
 PixelBox = tuple[float, float, float, float]
@@ -55,6 +57,36 @@ class EventAnnotation:
     @property
     def active(self) -> bool:
         return self.end is None
+
+
+def build_annotation_payload(
+    *,
+    videoname: str,
+    frame_width: int,
+    frame_height: int,
+    fps: float,
+    events: list[EventAnnotation],
+) -> dict[str, Any]:
+    """Serialize events into the canonical annotation JSON schema.
+
+    Shared by the annotator's Save and the FP-review TP export so both
+    write the identical on-disk format.
+    """
+    return {
+        "videoname": videoname,
+        "frame_width": frame_width,
+        "frame_height": frame_height,
+        "fps": fps,
+        "events": [
+            {
+                "type": event.event_type,
+                "start": event.start,
+                "end": event.end,
+                "bbox": [round(value, 6) for value in event.bbox],
+            }
+            for event in events
+        ],
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -107,6 +139,11 @@ def import_tkinter() -> None:
 
 def annotation_path_for(video_path: Path) -> Path:
     return video_path.with_name(video_path.name + ".json")
+
+
+def recovery_path_for(video_path: Path) -> Path:
+    """Hidden sidecar holding unsaved in-progress work for crash/quit recovery."""
+    return video_path.with_name(f".{video_path.name}.recovery.json")
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -192,6 +229,9 @@ class EventAnnotator:
         self.cv2 = cv2
         self.video_path: Path | None = None
         self.output_path: Path | None = None
+        self.recovery_path: Path | None = None
+        self.dirty = False
+        self.autosave_after_id: str | None = None
         self.capture: Any | None = None
         self.max_display_width = max_display_width
         self.max_display_height = max_display_height
@@ -289,8 +329,14 @@ class EventAnnotator:
         type_row.grid(row=0, column=0, sticky="ew")
         type_row.columnconfigure(1, weight=1)
         ttk.Label(type_row, text="Event type").grid(row=0, column=0, sticky="w")
-        self.type_var = tk.StringVar()
-        self.type_entry = ttk.Entry(type_row, textvariable=self.type_var, width=24)
+        self.type_var = tk.StringVar(value=EVENT_TYPES[0])
+        self.type_entry = ttk.Combobox(
+            type_row,
+            textvariable=self.type_var,
+            values=list(EVENT_TYPES),
+            state="readonly",
+            width=24,
+        )
         self.type_entry.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(2, 8))
 
         buttons = ttk.Frame(side)
@@ -432,7 +478,23 @@ class EventAnnotator:
         self.root.mainloop()
 
     def close(self) -> None:
-        self.save_annotations(show_status=False)
+        if self.dirty and self.video_path is not None:
+            answer = messagebox.askyesnocancel(
+                APP_TITLE,
+                f"You have unsaved changes for {self.video_path.name}.\n"
+                "Save before quitting?",
+            )
+            if answer is None:
+                return  # Cancel: abort the quit.
+            if answer:
+                self.save_annotations(show_status=False)
+            else:
+                # Discard from the proper file, but keep the recovery cache
+                # so the work can still be recovered next time.
+                self._flush_autosave()
+        else:
+            self._cancel_autosave()
+            self._delete_recovery_cache()
         if self.capture is not None:
             self.capture.release()
         self.root.destroy()
@@ -455,7 +517,9 @@ class EventAnnotator:
         if not video_path.exists():
             messagebox.showerror(APP_TITLE, f"Video file does not exist:\n{video_path}")
             return
-        self.save_annotations(show_status=False)
+        # Persist the previous video's in-progress work to its recovery cache
+        # (the proper file is only written on explicit Save).
+        self._flush_autosave()
         if self.playing:
             self.playing = False
             self.play_button.configure(text="Play")
@@ -474,6 +538,8 @@ class EventAnnotator:
             self.capture.release()
         self.video_path = video_path
         self.output_path = annotation_path_for(video_path)
+        self.recovery_path = recovery_path_for(video_path)
+        self.dirty = False
         self.capture = capture
         self.last_video_dir = video_path.parent
         self.fps = float(capture.get(self.cv2.CAP_PROP_FPS) or 0.0)
@@ -501,9 +567,9 @@ class EventAnnotator:
         self.timeline.configure(to=max(0, self.frame_count - 1))
         self.start_spin.configure(to=max(0, self.frame_count - 1))
         self.end_spin.configure(to=max(0, self.frame_count - 1))
-        self.root.title(f"{APP_TITLE} - {video_path.name}")
+        self._update_title()
         self._clear_edit_fields()
-        self._load_existing_annotations()
+        self._load_annotations_with_recovery()
         self._seek_to_frame(0)
         self._refresh_event_list()
         loaded_text = f" Loaded {len(self.events)} event(s)." if self.events else ""
@@ -733,6 +799,7 @@ class EventAnnotator:
         self._populate_edit_fields(event)
         self.draft_box = None
         self._refresh_event_list()
+        self._mark_dirty()
         self._set_status(f"Started event {self.selected_event + 1}: {event_type}.")
         self._render_frame()
 
@@ -749,7 +816,7 @@ class EventAnnotator:
         self.selected_event = index
         self._populate_edit_fields(event)
         self._refresh_event_list()
-        self.save_annotations(show_status=False)
+        self._mark_dirty()
         self._set_status(f"Ended event {index + 1} at frame {event.end}.")
         self._render_frame()
 
@@ -783,7 +850,7 @@ class EventAnnotator:
             self.draft_box = None
         self._populate_edit_fields(event)
         self._refresh_event_list()
-        self.save_annotations(show_status=False)
+        self._mark_dirty()
         self._set_status(f"Updated event {self.selected_event + 1}.")
         self._render_frame()
 
@@ -803,7 +870,7 @@ class EventAnnotator:
             self.selected_event = min(deleted, len(self.events) - 1)
             self._populate_edit_fields(self.events[self.selected_event])
         self._refresh_event_list()
-        self.save_annotations(show_status=False)
+        self._mark_dirty()
         self._set_status(f"Deleted event {deleted + 1}.")
         self._render_frame()
 
@@ -831,7 +898,7 @@ class EventAnnotator:
         self.end_var.set("" if event.end is None else str(event.end))
 
     def _clear_edit_fields(self) -> None:
-        self.type_var.set("")
+        self.type_var.set(EVENT_TYPES[0])
         self.start_var.set("")
         self.end_var.set("")
 
@@ -852,18 +919,11 @@ class EventAnnotator:
             self.event_list.selection_set(current_selection)
             self.event_list.see(current_selection)
 
-    def _load_existing_annotations(self) -> None:
-        if self.output_path is None:
-            return
-        if not self.output_path.exists():
-            return
-        try:
-            payload = json.loads(self.output_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            messagebox.showwarning(APP_TITLE, f"Could not load existing JSON:\n{exc}")
-            return
-
+    def _events_from_payload(self, payload: Any) -> list[EventAnnotation]:
+        """Parse and validate the events list from a saved/recovery payload."""
         loaded: list[EventAnnotation] = []
+        if not isinstance(payload, dict):
+            return loaded
         for raw_event in payload.get("events", []):
             if not isinstance(raw_event, dict):
                 continue
@@ -881,42 +941,135 @@ class EventAnnotator:
             if end is not None:
                 end = max(start, clamp_frame(end, self.frame_count))
             loaded.append(EventAnnotation(event_type=event_type, start=start, end=end, bbox=bbox))
+        return loaded
 
-        self.events = loaded
+    def _load_annotations_with_recovery(self) -> None:
+        """Offer unsaved work from a prior session, else load the saved file."""
+        if self._maybe_recover_from_cache():
+            return
+        self._load_existing_annotations()
+        self.dirty = False
+        self._update_title()
+
+    def _maybe_recover_from_cache(self) -> bool:
+        if self.recovery_path is None or not self.recovery_path.exists():
+            return False
+        try:
+            payload = json.loads(self.recovery_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            messagebox.showwarning(APP_TITLE, f"Could not read recovery cache:\n{exc}")
+            self._delete_recovery_cache()
+            return False
+        recovered = self._events_from_payload(payload)
+        if not recovered:
+            self._delete_recovery_cache()
+            return False
+        should_recover = messagebox.askyesno(
+            APP_TITLE,
+            "Unsaved work from a previous session was found for this video.\n"
+            "Recover it?\n\n"
+            "Choosing No discards the cached work and loads the saved file.",
+        )
+        if not should_recover:
+            self._delete_recovery_cache()
+            return False
+        self.events = recovered
+        self.selected_event = 0
+        self._populate_edit_fields(self.events[0])
+        self.dirty = True
+        self._update_title()
+        self._set_status(f"Recovered {len(self.events)} unsaved event(s).")
+        return True
+
+    def _load_existing_annotations(self) -> None:
+        if self.output_path is None or not self.output_path.exists():
+            return
+        try:
+            payload = json.loads(self.output_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            messagebox.showwarning(APP_TITLE, f"Could not load existing JSON:\n{exc}")
+            return
+        self.events = self._events_from_payload(payload)
         if self.events:
             self.selected_event = 0
             self._populate_edit_fields(self.events[0])
             self._set_status(f"Loaded {len(self.events)} event(s) from {self.output_path}.")
 
+    def _build_payload(self) -> dict[str, Any]:
+        return build_annotation_payload(
+            videoname=self.video_path.name if self.video_path else "",
+            frame_width=self.frame_width,
+            frame_height=self.frame_height,
+            fps=self.fps,
+            events=self.events,
+        )
+
     def save_annotations(self, *, show_status: bool = True) -> None:
         if self.video_path is None or self.output_path is None:
             return
-        payload = {
-            "videoname": self.video_path.name,
-            "frame_width": self.frame_width,
-            "frame_height": self.frame_height,
-            "fps": self.fps,
-            "events": [
-                {
-                    "type": event.event_type,
-                    "start": event.start,
-                    "end": event.end,
-                    "bbox": [round(value, 6) for value in event.bbox],
-                }
-                for event in self.events
-            ],
-        }
         try:
             self.output_path.parent.mkdir(parents=True, exist_ok=True)
             self.output_path.write_text(
-                json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+                json.dumps(self._build_payload(), indent=2, ensure_ascii=False) + "\n",
                 encoding="utf-8",
             )
         except OSError as exc:
             self._set_status(f"Could not save JSON: {exc}")
             return
+        self.dirty = False
+        self._cancel_autosave()
+        self._delete_recovery_cache()
+        self._update_title()
         if show_status:
             self._set_status(f"Saved {len(self.events)} event(s) to {self.output_path}.")
+
+    def _mark_dirty(self) -> None:
+        self.dirty = True
+        self._update_title()
+        self._schedule_autosave()
+
+    def _schedule_autosave(self) -> None:
+        if self.autosave_after_id is not None:
+            self.root.after_cancel(self.autosave_after_id)
+        self.autosave_after_id = self.root.after(AUTOSAVE_DELAY_MS, self._write_recovery_cache)
+
+    def _cancel_autosave(self) -> None:
+        if self.autosave_after_id is not None:
+            self.root.after_cancel(self.autosave_after_id)
+            self.autosave_after_id = None
+
+    def _flush_autosave(self) -> None:
+        """Cancel any pending debounce and write the cache now if dirty."""
+        self._cancel_autosave()
+        if self.dirty:
+            self._write_recovery_cache()
+
+    def _write_recovery_cache(self) -> None:
+        self.autosave_after_id = None
+        if self.recovery_path is None or self.video_path is None:
+            return
+        try:
+            self.recovery_path.write_text(
+                json.dumps(self._build_payload(), indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            self._set_status(f"Could not write recovery cache: {exc}")
+
+    def _delete_recovery_cache(self) -> None:
+        if self.recovery_path is None:
+            return
+        try:
+            self.recovery_path.unlink(missing_ok=True)
+        except OSError as exc:
+            self._set_status(f"Could not remove recovery cache: {exc}")
+
+    def _update_title(self) -> None:
+        if self.video_path is None:
+            self.root.title(APP_TITLE)
+            return
+        prefix = "*" if self.dirty else ""
+        self.root.title(f"{prefix}{APP_TITLE} - {self.video_path.name}")
 
     def _set_status(self, message: str) -> None:
         self.last_status = message
