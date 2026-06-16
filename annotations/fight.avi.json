@@ -1,0 +1,30 @@
+{
+  "videoname": "fight.avi",
+  "frame_width": 1920,
+  "frame_height": 1080,
+  "fps": 25.007978,
+  "events": [
+    {
+      "type": "fighting",
+      "start": 1329,
+      "end": 1889,
+      "bbox": [
+        0.511719,
+        0.273611,
+        0.774219,
+        0.725
+      ]
+    },
+    {
+      "type": "fighting",
+      "start": 1893,
+      "end": 2350,
+      "bbox": [
+        0.463281,
+        0.269444,
+        0.703906,
+        0.641667
+      ]
+    }
+  ]
+}
