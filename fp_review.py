@@ -6,15 +6,17 @@ the clip is played in a loop at high speed with the detection boxes drawn on
 top. The reviewer presses 1 (true positive) or Space (false positive); the
 tool records the verdict and auto-advances to the next unreviewed clip.
 
-A true positive additionally exports a `<clip>.json` annotation in the same
-schema used by event_annotator, so it drops straight into the existing pipeline.
-False positives are only logged in fp_review_results.json.
+A true positive additionally exports a `<clip>_event-annotation.json`
+annotation in the same schema used by event_annotator, so it drops straight
+into the existing pipeline. False positives export an empty but valid
+annotation file and are logged in fp_review_results.json.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -31,10 +33,12 @@ from review_results import (
 )
 
 WINDOW_NAME = "FP Review"
+TRACKBAR_NAME = "Frame"
 SPEEDS = (8, 16)
 DEFAULT_SPEED = 8
 MAX_DISPLAY_WIDTH = 1280
 MAX_DISPLAY_HEIGHT = 720
+STATUS_PANEL_HEIGHT = 50
 # Crossing detections map onto the annotator's 'zone' event type.
 TP_EVENT_TYPE = "zone"
 
@@ -46,6 +50,8 @@ TONE_COLORS = {
 DEFAULT_BOX_COLOR = (200, 200, 200)
 HUD_COLOR = (245, 245, 245)
 HUD_SHADOW = (20, 20, 20)
+STATUS_BG = (30, 30, 30)
+STATUS_MUTED = (185, 185, 185)
 
 KEY_TP = ord("1")
 KEY_FP = ord(" ")
@@ -103,19 +109,35 @@ def _pick_folder() -> Path | None:
     return Path(chosen).expanduser().resolve() if chosen else None
 
 
+def configure_qt_font_dir() -> None:
+    """Point OpenCV's Qt backend at system fonts when the wheel has none."""
+    if os.environ.get("QT_QPA_FONTDIR"):
+        return
+    for candidate in (
+        Path("/usr/share/fonts/truetype/dejavu"),
+        Path("/usr/share/fonts/truetype/liberation"),
+        Path("/usr/share/fonts/truetype/noto"),
+        Path("/usr/share/fonts"),
+    ):
+        if candidate.is_dir():
+            os.environ["QT_QPA_FONTDIR"] = str(candidate)
+            return
+
+
 def find_clips(folder: Path) -> list[Path]:
     return [
         mp4
         for mp4 in sorted(folder.glob("*.mp4"))
-        if overlay_path_for(mp4).exists()
+        if overlay_path_for(mp4).exists() and not annotation_path_for(mp4).exists()
     ]
 
 
 def print_controls() -> None:
     print(
         "\nControls:\n"
-        "  1        Mark TRUE positive (saves <clip>.json) and advance\n"
+        "  1        Mark TRUE positive (saves <clip>_event-annotation.json) and advance\n"
         "  Space    Mark FALSE positive and advance\n"
+        "  Frame    Drag the OpenCV slider to seek within the current clip\n"
         "  n / b    Next / back without a verdict\n"
         "  r        Replay current clip from start\n"
         "  t        Toggle playback speed (x8 / x16)\n"
@@ -131,18 +153,15 @@ class FPReviewer:
         self.speed = speed
         self.results_path = results_path_for(folder)
         self.results = load_results(self.results_path)
-        self.index = self._first_unreviewed()
+        self.index = 0
         self.should_quit = False
-
-    def _first_unreviewed(self) -> int:
-        for i, clip in enumerate(self.clips):
-            if clip.name not in self.results:
-                return i
-        return 0
+        self.pending_seek: int | None = None
+        self.suppress_trackbar = False
 
     def run(self) -> None:
         cv2 = self.cv2
         cv2.namedWindow(WINDOW_NAME)
+        cv2.createTrackbar(TRACKBAR_NAME, WINDOW_NAME, 0, 1, self._on_trackbar_changed)
         try:
             while not self.should_quit and self.clips:
                 self.index = max(0, min(self.index, len(self.clips) - 1))
@@ -179,13 +198,18 @@ class FPReviewer:
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
         if frame_count <= 0:
             frame_count = len(overlay.times) or 1
+        self._configure_trackbar(frame_count)
         scale = min(1.0, MAX_DISPLAY_WIDTH / width, MAX_DISPLAY_HEIGHT / height)
         ctx = ClipContext(overlay, fps, frame_count, width, height)
         interval = max(1, round(1000.0 / fps))
 
         pos = 0
+        self._set_trackbar_pos(pos)
         try:
             while True:
+                pending_seek = self._consume_pending_seek(frame_count)
+                if pending_seek is not None:
+                    pos = pending_seek
                 frame = self._read_at(cap, pos)
                 if frame is None:
                     frame = self._read_at(cap, 0)
@@ -193,8 +217,17 @@ class FPReviewer:
                     if frame is None:
                         print(f"SKIP {clip.name}: playback read error")
                         return "next", ctx
-                display = self._render(frame, scale, overlay.boxes_at(pos / fps), clip)
+                self._update_window_title(clip, pos, frame_count)
+                display = self._render(
+                    frame,
+                    scale,
+                    overlay.boxes_at(pos / fps),
+                    clip,
+                    pos,
+                    frame_count,
+                )
                 cv2.imshow(WINDOW_NAME, display)
+                self._set_trackbar_pos(pos)
                 key = cv2.waitKey(interval) & 0xFF
 
                 if key in KEY_QUIT:
@@ -212,13 +245,60 @@ class FPReviewer:
                     continue
                 if key == KEY_SPEED:
                     self.speed = SPEEDS[1] if self.speed == SPEEDS[0] else SPEEDS[0]
+                    self._update_window_title(clip, pos, frame_count)
                     continue
 
+                pending_seek = self._consume_pending_seek(frame_count)
+                if pending_seek is not None:
+                    pos = pending_seek
+                    continue
                 pos += self.speed
                 if pos >= frame_count:
                     pos = 0
         finally:
             cap.release()
+
+    def _status_text(self, clip: Path, pos: int, frame_count: int) -> str:
+        total = len(self.clips)
+        last_frame = max(0, frame_count - 1)
+        return (
+            f"clip {self.index + 1}/{total} | frame {pos}/{last_frame} | "
+            f"{clip.name} | speed x{self.speed}"
+        )
+
+    def _update_window_title(self, clip: Path, pos: int, frame_count: int) -> None:
+        text = self._status_text(clip, pos, frame_count)
+        if hasattr(self.cv2, "setWindowTitle"):
+            try:
+                self.cv2.setWindowTitle(WINDOW_NAME, f"{WINDOW_NAME} - {text}")
+            except self.cv2.error:
+                pass
+
+    def _configure_trackbar(self, frame_count: int) -> None:
+        max_pos = max(1, frame_count - 1)
+        if hasattr(self.cv2, "setTrackbarMin"):
+            self.cv2.setTrackbarMin(TRACKBAR_NAME, WINDOW_NAME, 0)
+        self.cv2.setTrackbarMax(TRACKBAR_NAME, WINDOW_NAME, max_pos)
+        self.pending_seek = None
+
+    def _on_trackbar_changed(self, pos: int) -> None:
+        if self.suppress_trackbar:
+            return
+        self.pending_seek = pos
+
+    def _set_trackbar_pos(self, pos: int) -> None:
+        self.suppress_trackbar = True
+        try:
+            self.cv2.setTrackbarPos(TRACKBAR_NAME, WINDOW_NAME, int(pos))
+        finally:
+            self.suppress_trackbar = False
+
+    def _consume_pending_seek(self, frame_count: int) -> int | None:
+        if self.pending_seek is None:
+            return None
+        pos = max(0, min(int(self.pending_seek), max(0, frame_count - 1)))
+        self.pending_seek = None
+        return pos
 
     def _read_at(self, cap: Any, pos: int) -> Any | None:
         cap.set(self.cv2.CAP_PROP_POS_FRAMES, pos)
@@ -233,6 +313,8 @@ class FPReviewer:
         scale: float,
         boxes: tuple[OverlayBox, ...],
         clip: Path,
+        pos: int,
+        frame_count: int,
     ) -> Any:
         cv2 = self.cv2
         if scale != 1.0:
@@ -243,7 +325,40 @@ class FPReviewer:
         else:
             display = frame.copy()
         self._draw_boxes(display, boxes, scale)
-        self._draw_hud(display, clip)
+        return self._append_status_panel(display, clip, pos, frame_count)
+
+    def _append_status_panel(
+        self,
+        image: Any,
+        clip: Path,
+        pos: int,
+        frame_count: int,
+    ) -> Any:
+        cv2 = self.cv2
+        display = cv2.copyMakeBorder(
+            image,
+            0,
+            STATUS_PANEL_HEIGHT,
+            0,
+            0,
+            cv2.BORDER_CONSTANT,
+            value=STATUS_BG,
+        )
+        top = image.shape[0]
+        self._text(
+            display,
+            self._status_text(clip, pos, frame_count),
+            10,
+            top + 20,
+            HUD_COLOR,
+        )
+        self._text(
+            display,
+            "Frame slider=seek  1=TP  SPACE=FP  n/b=clip  r=replay  t=speed  q=quit",
+            10,
+            top + 42,
+            STATUS_MUTED,
+        )
         return display
 
     def _draw_boxes(
@@ -259,25 +374,6 @@ class FPReviewer:
             cv2.rectangle(image, (x1, y1), (x2, y2), color, 2)
             if box.label:
                 self._text(image, box.label, x1 + 3, max(14, y1 - 6), color)
-
-    def _draw_hud(self, image: Any, clip: Path) -> None:
-        reviewed = len(self.results)
-        total = len(self.clips)
-        tp = sum(1 for e in self.results.values() if e.get("verdict") == VERDICT_TP)
-        fp = reviewed - tp
-        lines = [
-            f"{self.index + 1}/{total}  {clip.name}",
-            f"speed x{self.speed}   reviewed {reviewed}/{total}   TP {tp}  FP {fp}",
-        ]
-        previous = self.results.get(clip.name, {}).get("verdict")
-        if previous:
-            lines.append(f"previous verdict: {previous}")
-        y = 22
-        for line in lines:
-            self._text(image, line, 10, y, HUD_COLOR)
-            y += 24
-        legend = "1=TP  SPACE=FP  n=next  b=back  r=replay  t=speed  q=quit"
-        self._text(image, legend, 10, image.shape[0] - 12, HUD_COLOR)
 
     def _text(self, image: Any, text: str, x: int, y: int, color: Any) -> None:
         cv2 = self.cv2
@@ -313,7 +409,7 @@ class FPReviewer:
         if verdict == VERDICT_TP:
             annotation = self._save_tp_annotation(clip, ctx)
         else:
-            self._remove_stale_annotation(clip)
+            annotation = self._save_empty_annotation(clip, ctx)
         self.results = record_verdict(self.results, clip.name, verdict, annotation)
         self._persist()
         suffix = f" -> {annotation}" if annotation else ""
@@ -344,15 +440,24 @@ class FPReviewer:
             return None
         return out.name
 
-    def _remove_stale_annotation(self, clip: Path) -> None:
-        previous = self.results.get(clip.name)
-        if not previous or previous.get("verdict") != VERDICT_TP:
-            return
+    def _save_empty_annotation(self, clip: Path, ctx: ClipContext) -> str | None:
+        payload = build_annotation_payload(
+            videoname=clip.name,
+            frame_width=ctx.width,
+            frame_height=ctx.height,
+            fps=ctx.video_fps,
+            events=[],
+        )
         out = annotation_path_for(clip)
         try:
-            out.unlink(missing_ok=True)
+            out.write_text(
+                json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
         except OSError as exc:
-            print(f"WARN: could not remove {out.name}: {exc}")
+            print(f"WARN: could not write {out.name}: {exc}")
+            return None
+        return out.name
 
     def _persist(self) -> None:
         try:
@@ -370,13 +475,16 @@ def main() -> None:
         raise SystemExit(f"Not a folder: {folder}")
     clips = find_clips(folder)
     if not clips:
-        raise SystemExit(f"No <clip>.mp4 + overlay pairs found in {folder}")
+        raise SystemExit(
+            f"No unannotated <clip>.mp4 + overlay pairs found in {folder}"
+        )
 
+    configure_qt_font_dir()
     cv2 = import_cv2()
     reviewer = FPReviewer(cv2, folder, clips, args.speed)
     print(
-        f"Loaded {len(clips)} clip(s); "
-        f"{len(reviewer.results)} already reviewed. Starting at #{reviewer.index + 1}."
+        f"Loaded {len(clips)} unannotated clip(s). "
+        f"Starting at #{reviewer.index + 1}."
     )
     print_controls()
     reviewer.run()

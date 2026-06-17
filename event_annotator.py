@@ -138,6 +138,10 @@ def import_tkinter() -> None:
 
 
 def annotation_path_for(video_path: Path) -> Path:
+    return video_path.with_name(video_path.name + "_event-annotation.json")
+
+
+def legacy_annotation_path_for(video_path: Path) -> Path:
     return video_path.with_name(video_path.name + ".json")
 
 
@@ -982,10 +986,17 @@ class EventAnnotator:
         return True
 
     def _load_existing_annotations(self) -> None:
-        if self.output_path is None or not self.output_path.exists():
+        if self.video_path is None or self.output_path is None:
             return
+        input_path = self.output_path
+        if not input_path.exists():
+            legacy_path = legacy_annotation_path_for(self.video_path)
+            if legacy_path.exists():
+                input_path = legacy_path
+            else:
+                return
         try:
-            payload = json.loads(self.output_path.read_text(encoding="utf-8"))
+            payload = json.loads(input_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             messagebox.showwarning(APP_TITLE, f"Could not load existing JSON:\n{exc}")
             return
@@ -993,7 +1004,7 @@ class EventAnnotator:
         if self.events:
             self.selected_event = 0
             self._populate_edit_fields(self.events[0])
-            self._set_status(f"Loaded {len(self.events)} event(s) from {self.output_path}.")
+            self._set_status(f"Loaded {len(self.events)} event(s) from {input_path}.")
 
     def _build_payload(self) -> dict[str, Any]:
         return build_annotation_payload(

@@ -32,13 +32,13 @@ fast.
 By default the tool reads/writes annotation JSON next to each selected video as:
 
 ```text
-<video file name>.json
+<video file name>_event-annotation.json
 ```
 
 For example:
 
 ```text
-camera_video.mp4.json
+camera_video.mp4_event-annotation.json
 ```
 
 ## Workflow
@@ -50,9 +50,9 @@ camera_video.mp4.json
 5. Select the active event and press `End Event`.
 6. Press `Open Video` to continue with the next file, or `Quit` to exit.
 
-The proper `<video>.json` is written only when you **Save** (`Ctrl+S` or the
-`Save` button), or when you choose **Save** on the prompt shown if you quit with
-unsaved changes.
+The proper `<video>_event-annotation.json` is written only when you **Save**
+(`Ctrl+S` or the `Save` button), or when you choose **Save** on the prompt shown
+if you quit with unsaved changes.
 
 While you edit, in-progress work is continuously auto-saved to a hidden recovery
 cache next to the video (`.<video>.recovery.json`), so an accidental quit or
@@ -98,8 +98,9 @@ The JSON format is:
 
 A separate triage tool for reviewing detector output as true/false positives.
 It pairs each `<clip>.mp4` with its sibling `<clip>.mp4.overlay.json` (detector
-boxes), plays the clip in a loop at high speed with the boxes drawn on top, and
-captures a verdict per clip.
+boxes), skips clips that already have `<clip>_event-annotation.json`, plays each
+remaining clip in a loop at high speed with the boxes drawn on top, and captures
+a verdict per clip.
 
 ```bash
 python3 fp_review.py /path/to/clips_folder      # or omit the path for a folder picker
@@ -109,8 +110,9 @@ python3 fp_review.py /path/to/clips_folder --speed 16
 Keys:
 
 ```text
-1        Mark TRUE positive (writes <clip>.json) and advance
+1        Mark TRUE positive (writes <clip>_event-annotation.json) and advance
 Space    Mark FALSE positive and advance
+Frame bar Drag to seek within the current clip
 n / b    Next / back without a verdict
 r        Replay current clip from start
 t        Toggle playback speed (x8 / x16)
@@ -122,11 +124,14 @@ Behavior:
 - **Overlay sync** — overlay frames are time-indexed, so boxes are matched to
   each video frame by timestamp (not by frame index). Box color follows the
   `tone` field (`danger` = red, `warning` = amber).
-- **TP** — a `<clip>.json` annotation is written in the same schema as above. A
-  single `zone` event is derived from the `restricted zone crossing` detection:
-  its active frame range and the union of its boxes (normalized). These files
-  open directly in the annotator.
-- **FP** — logged only; no annotation file is written.
+- **Seeking** — the OpenCV window has a `Frame` slider for clip boundaries and
+  manual rewinding/fast-forwarding. The current clip/frame counter is shown in
+  a status strip below the video frame, not drawn over the frame itself.
+- **TP** — a `<clip>_event-annotation.json` annotation is written in the same
+  schema as above. A single `zone` event is derived from the
+  `restricted zone crossing` detection: its active frame range and the union of
+  its boxes (normalized). These files open directly in the annotator.
+- **FP** — a `<clip>_event-annotation.json` annotation is written with an empty
+  `events` list.
 - **Resume / audit** — every verdict is recorded in `fp_review_results.json` in
-  the folder. On launch, already-reviewed clips are skipped (review starts at the
-  first unreviewed clip).
+  the folder. On launch, clips with existing annotation files are skipped.
